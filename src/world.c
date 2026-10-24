@@ -1,19 +1,20 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "world.h"
-
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
 int world_init(World *w, const MapData *map, const Config *cfg,
-               int st_r, int st_c)
+               int st_r, int st_c, unsigned int seed)
 {
     memset(w, 0, sizeof(*w));
-    w->map = map;
-    w->cfg = cfg;
-    w->st_r = st_r;
-    w->st_c = st_c;
+    w->map    = map;
+    w->cfg    = cfg;
+    w->st_r   = st_r;
+    w->st_c   = st_c;
+    w->seed   = seed;
+    w->main_rng = seed ^ 0xA5A5A5A5u;
 
     int n = map->rows * map->cols;
 
@@ -21,8 +22,10 @@ int world_init(World *w, const MapData *map, const Config *cfg,
     w->occupant = calloc((size_t)n, sizeof(Occupant));
     w->team_id  = calloc((size_t)n, sizeof(int));
     w->burn_age = malloc((size_t)n * sizeof(int));
+    w->next_state = calloc((size_t)n, sizeof(_Atomic FireState));
 
-    if (!w->state || !w->occupant || !w->team_id || !w->burn_age) {
+    if (!w->state || !w->occupant || !w->team_id ||
+        !w->burn_age || !w->next_state) {
         world_free(w);
         return -1;
     }
@@ -31,12 +34,12 @@ int world_init(World *w, const MapData *map, const Config *cfg,
         w->state[i]    = ST_SAFE;
         w->occupant[i] = OCC_NONE;
         w->burn_age[i] = -1;
+        atomic_store(&w->next_state[i], ST_SAFE);
     }
 
-    /* ── станция ── */
     w->occupant[st_r * map->cols + st_c] = OCC_STATION;
 
-
+    /* Датчики + станция как последний датчик */
     int map_sensor_count = map->sensors_count;
     w->sensors_count = map_sensor_count + 1;
     w->sensors = calloc((size_t)w->sensors_count, sizeof(Sensor));
@@ -48,14 +51,11 @@ int world_init(World *w, const MapData *map, const Config *cfg,
         w->sensors[i].c  = map->sensors[i].c;
         w->occupant[w->sensors[i].r * map->cols + w->sensors[i].c] = OCC_SENSOR;
     }
-
-    /* станция как датчик — последняя запись */
     w->sensors[map_sensor_count].id = map_sensor_count + 1;
     w->sensors[map_sensor_count].r  = st_r;
     w->sensors[map_sensor_count].c  = st_c;
-    /* намеренно НЕ ставим OCC_SENSOR: пусть клетка остаётся OCC_STATION */
 
-    /* ── группы ── */
+    /* Группы */
     w->teams_count = cfg->team_count;
     if (w->teams_count > 0) {
         w->teams = calloc((size_t)w->teams_count, sizeof(FireTeam));
@@ -74,7 +74,7 @@ int world_init(World *w, const MapData *map, const Config *cfg,
         }
     }
 
-    /* ── начальные очаги ── */
+    /* Очаги */
     for (int i = 0; i < map->ignition_count; i++) {
         int r = map->ignition[i].r;
         int c = map->ignition[i].c;
@@ -83,8 +83,9 @@ int world_init(World *w, const MapData *map, const Config *cfg,
         w->burn_age[idx] = 0;
     }
 
-    /* ── сообщения ── */
     w->next_message_id = 1;
+    w->next_task_id    = 1;
+
     w->sensor_reported = calloc((size_t)w->sensors_count *
                                 (size_t)(map->rows * map->cols), 1);
     if (!w->sensor_reported && w->sensors_count > 0) {
@@ -92,22 +93,55 @@ int world_init(World *w, const MapData *map, const Config *cfg,
         return -1;
     }
 
-    /* ── задачи ── */
-    w->next_task_id = 1;
+    /* Многопоточные примитивы */
+    pthread_mutex_init(&w->teams_lock,        NULL);
+    pthread_mutex_init(&w->in_flight.lock,    NULL);
+    pthread_mutex_init(&w->inbox.lock,        NULL);
+    atomic_store(&w->stop, 0);
 
-    /* ── журнал ── */
+    w->num_sensor_threads = w->sensors_count;
+    w->num_team_threads   = w->teams_count;
+    w->num_fire_workers   = MAX_FIRE_WORKERS;
+
+    if (pthread_barrier_init(&w->barrier_sensors, NULL,
+                             (unsigned)w->num_sensor_threads + 1) != 0) {
+        world_free(w);
+        return -1;
+    }
+    if (pthread_barrier_init(&w->barrier_teams, NULL,
+                             (unsigned)w->num_team_threads + 1) != 0) {
+        world_free(w);
+        return -1;
+    }
+    if (pthread_barrier_init(&w->barrier_fire, NULL,
+                             (unsigned)w->num_fire_workers + 1) != 0) {
+        world_free(w);
+        return -1;
+    }
+
     log_init(&w->log);
-
     w->tick = 0;
     return 0;
 }
 
 void world_free(World *w) {
     if (!w) return;
+
+    pthread_barrier_destroy(&w->barrier_sensors);
+    pthread_barrier_destroy(&w->barrier_teams);
+    pthread_barrier_destroy(&w->barrier_fire);
+
+    pthread_mutex_destroy(&w->teams_lock);
+    pthread_mutex_destroy(&w->in_flight.lock);
+    pthread_mutex_destroy(&w->inbox.lock);
+
+    log_destroy(&w->log);
+
     free(w->state);
     free(w->occupant);
     free(w->team_id);
     free(w->burn_age);
+    free(w->next_state);
     free(w->sensors);
     free(w->teams);
     free(w->in_flight.items);
@@ -115,6 +149,7 @@ void world_free(World *w) {
     free(w->seen_ids);
     free(w->sensor_reported);
     free(w->tasks.items);
+
     memset(w, 0, sizeof(*w));
 }
 
@@ -133,7 +168,6 @@ CellView world_cell_view(const World *w, int r, int c) {
     switch (w->state[idx]) {
         case ST_BURNING:      cv.state = 'F'; break;
         case ST_BURNT:        cv.state = '#'; break;
-        case ST_EXTINGUISHED: cv.state = ' '; break;
         default:              cv.state = ' '; break;
     }
 

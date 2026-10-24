@@ -5,28 +5,29 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ─── Очередь ─────────────────────────────────────────── */
-
 static void queue_push(MessageQueue *q, const Message *m) {
+    pthread_mutex_lock(&q->lock);
     if (q->count >= q->capacity) {
         int ncap = q->capacity ? q->capacity * 2 : 16;
         Message *ni = realloc(q->items, (size_t)ncap * sizeof(Message));
-        if (!ni) return;
+        if (!ni) { pthread_mutex_unlock(&q->lock); return; }
         q->items = ni;
         q->capacity = ncap;
     }
     q->items[q->count++] = *m;
+    pthread_mutex_unlock(&q->lock);
 }
 
 static void queue_remove_at(MessageQueue *q, int idx) {
-    if (idx < 0 || idx >= q->count) return;
-    if (idx < q->count - 1)
-        memmove(&q->items[idx], &q->items[idx + 1],
-                (size_t)(q->count - idx - 1) * sizeof(Message));
-    q->count--;
+    pthread_mutex_lock(&q->lock);
+    if (idx >= 0 && idx < q->count) {
+        if (idx < q->count - 1)
+            memmove(&q->items[idx], &q->items[idx + 1],
+                    (size_t)(q->count - idx - 1) * sizeof(Message));
+        q->count--;
+    }
+    pthread_mutex_unlock(&q->lock);
 }
-
-/* ─── Учёт обработанных id ────────────────────────────── */
 
 static int seen_has(const World *w, int id) {
     for (int i = 0; i < w->seen_count; i++)
@@ -46,57 +47,49 @@ static int seen_add(World *w, int id) {
     return 0;
 }
 
-/* ─── Случайное число [0,1) ───────────────────────────── */
-
-static double rnd01(void) {
-    return (double)rand() / ((double)RAND_MAX + 1.0);
+static double rnd01(unsigned int *rng) {
+    return (double)rand_r(rng) / ((double)RAND_MAX + 1.0);
 }
 
-static int rnd_range(int lo, int hi) {
+static int rnd_range(unsigned int *rng, int lo, int hi) {
     if (hi < lo) { int t = lo; lo = hi; hi = t; }
-    return lo + rand() % (hi - lo + 1);
+    return lo + rand_r(rng) % (hi - lo + 1);
 }
 
-/* ─── Создание сообщения ──────────────────────────────── */
-
-void messages_send(World *w, int sensor_idx, int origin_r, int origin_c) {
+void messages_send(World *w, int sensor_idx, int r, int c, unsigned int *rng) {
     const Config *cfg = w->cfg;
     const Sensor *s   = &w->sensors[sensor_idx];
 
-    /* потеря на создании */
-    if (rnd01() < cfg->msg_loss_prob) {
+    if (rnd01(rng) < cfg->msg_loss_prob) {
         log_add(&w->log, w->tick,
-                "Сообщение от датчика #%d потеряно в канале",
-                s->id);
+                "Сообщение от датчика #%d потеряно в канале", s->id);
         return;
     }
 
-    int delay = rnd_range(cfg->msg_delay_min, cfg->msg_delay_max);
+    int delay = rnd_range(rng, cfg->msg_delay_min, cfg->msg_delay_max);
 
+    /* next_message_id инкрементируется в фазе 1 из N потоков —
+     * защищаем через teams_lock как «общий» мьютекс мира,
+     * либо можно вынести отдельный id_lock. Здесь используем teams_lock. */
+    pthread_mutex_lock(&w->teams_lock);
     Message m;
     m.id            = w->next_message_id++;
+    pthread_mutex_unlock(&w->teams_lock);
+
     m.sensor_id     = s->id;
-    m.origin_r      = origin_r;
-    m.origin_c      = origin_c;
+    m.origin_r      = r;
+    m.origin_c      = c;
     m.created_tick  = w->tick;
     m.delivery_tick = w->tick + delay;
     m.is_duplicate  = 0;
 
     queue_push(&w->in_flight, &m);
 
-    const char *who = (s->r == w->st_r && s->c == w->st_c) ? "Станция" : "Датчик";
-    if (s->r == w->st_r && s->c == w->st_c) {
-        log_add(&w->log, w->tick,
-                "Станция шлёт сообщение #%d о (%d,%d), задержка %d",
-                m.id, origin_r + 1, origin_c + 1, delay);
-    } else {
-        log_add(&w->log, w->tick,
-                "Датчик #%d шлёт сообщение #%d о (%d,%d), задержка %d",
-                s->id, m.id, origin_r + 1, origin_c + 1, delay);
-    }
-    (void)who;
-    /* дублирование */
-    if (rnd01() < cfg->msg_dup_prob) {
+    log_add(&w->log, w->tick,
+            "Датчик #%d шлёт сообщение #%d о (%d,%d), задержка %d",
+            s->id, m.id, r + 1, c + 1, delay);
+
+    if (rnd01(rng) < cfg->msg_dup_prob) {
         Message dup = m;
         dup.is_duplicate = 1;
         queue_push(&w->in_flight, &dup);
@@ -105,20 +98,23 @@ void messages_send(World *w, int sensor_idx, int origin_r, int origin_c) {
     }
 }
 
-void messages_send_team(World *w, int team_id, int r, int c) {
+void messages_send_team(World *w, int team_id, int r, int c, unsigned int *rng) {
     const Config *cfg = w->cfg;
 
-    if (rnd01() < cfg->msg_loss_prob) {
+    if (rnd01(rng) < cfg->msg_loss_prob) {
         log_add(&w->log, w->tick,
                 "Сообщение от группы #%d потеряно в канале", team_id);
         return;
     }
 
-    int delay = rnd_range(cfg->msg_delay_min, cfg->msg_delay_max);
+    int delay = rnd_range(rng, cfg->msg_delay_min, cfg->msg_delay_max);
 
+    pthread_mutex_lock(&w->teams_lock);
     Message m;
     m.id            = w->next_message_id++;
-    m.sensor_id     = 100 + team_id;   /* 100+ помечает команду */
+    pthread_mutex_unlock(&w->teams_lock);
+
+    m.sensor_id     = 100 + team_id;
     m.origin_r      = r;
     m.origin_c      = c;
     m.created_tick  = w->tick;
@@ -130,32 +126,26 @@ void messages_send_team(World *w, int team_id, int r, int c) {
     log_add(&w->log, w->tick,
             "Группа #%d шлёт сообщение #%d о (%d,%d), задержка %d",
             team_id, m.id, r + 1, c + 1, delay);
-
-    if (rnd01() < cfg->msg_dup_prob) {
-        Message dup = m;
-        dup.is_duplicate = 1;
-        queue_push(&w->in_flight, &dup);
-        log_add(&w->log, w->tick,
-                "Сообщение #%d продублировано в канале", m.id);
-    }
 }
 
-/* ─── Фаза 2: продвижение и доставка ──────────────────── */
-
 void messages_tick(World *w) {
-    for (int i = 0; i < w->in_flight.count; ) {
+    /* все сенсоры уже отстрелялись (после барьера) — пишем in_flight безопасно */
+    int i = 0;
+    while (i < w->in_flight.count) {
         Message *m = &w->in_flight.items[i];
         if (m->delivery_tick > w->tick) { i++; continue; }
 
-        if (seen_has(w, m->id)) {
+        Message copy = *m;
+
+        if (seen_has(w, copy.id)) {
             log_add(&w->log, w->tick,
-                    "Дубликат сообщения #%d отброшен", m->id);
+                    "Дубликат сообщения #%d отброшен", copy.id);
         } else {
-            seen_add(w, m->id);
-            queue_push(&w->inbox, m);
+            seen_add(w, copy.id);
+            queue_push(&w->inbox, &copy);
             log_add(&w->log, w->tick,
                     "Сообщение #%d доставлено в центр: (%d,%d)",
-                    m->id, m->origin_r + 1, m->origin_c + 1);
+                    copy.id, copy.origin_r + 1, copy.origin_c + 1);
         }
         queue_remove_at(&w->in_flight, i);
     }

@@ -3,26 +3,17 @@
 
 #include "world.h"
 
-/* Как завершился прогон. */
 typedef enum {
-    RESULT_RUNNING = 0,       /* ещё идёт, не финал */
-    RESULT_EXTINGUISHED,      /* пожар потушен */
-    RESULT_TERRITORY_EXHAUSTED,/* всё, что могло, выгорело */
-    RESULT_TICK_LIMIT,        /* достигнут end.max_ticks */
-    RESULT_INTERRUPTED        /* Ctrl+C */
+    RESULT_RUNNING = 0,
+    RESULT_EXTINGUISHED,
+    RESULT_TERRITORY_EXHAUSTED,
+    RESULT_TICK_LIMIT,
+    RESULT_INTERRUPTED
 } SimResult;
 
-/* Один такт: все фазы в строгом порядке. */
-void sim_tick(World *w);
-
-/* Проверить условия завершения. */
-SimResult sim_finished(const World *w);
-
-/* Строковое имя результата. */
+void       sim_tick(World *w);
+SimResult  sim_finished(const World *w);
+SimResult  sim_run(World *w);
 const char *sim_result_name(SimResult r);
-
-/* Прогнать полную симуляцию до завершения (без интерактива).
- * Возвращает результат; итоговый такт — в w->tick. */
-SimResult sim_run(World *w);
 
 #endif
