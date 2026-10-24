@@ -1,0 +1,21 @@
+# Артефакты сборки
+build/
+*.o
+*.d
+fire
+forest-fire-sim
+
+# Логи и результаты
+logs/*.log
+logs/*.csv
+*.log
+
+# Временные файлы редакторов
+*.swp
+*~
+.vscode/
+.idea/
+
+# Ядровые дампы
+core
+core.*
