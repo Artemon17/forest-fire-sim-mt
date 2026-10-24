@@ -21,26 +21,25 @@ int sensor_burning_in_view(const World *w, int sensor_idx) {
     return count;
 }
 
-void sensors_observe(World *w) {
-    int R = w->map->rows, C = w->map->cols;
+void sensors_observe_one(World *w, int sensor_idx, unsigned int *rng) {
+    const Sensor *s = &w->sensors[sensor_idx];
     int rad = w->cfg->sensor_radius;
+    int R = w->map->rows, C = w->map->cols;
     int n_cells = R * C;
 
-    for (int i = 0; i < w->sensors_count; i++) {
-        const Sensor *s = &w->sensors[i];
-        unsigned char *reported = w->sensor_reported + (size_t)i * n_cells;
+    unsigned char *reported = w->sensor_reported +
+                              (size_t)sensor_idx * (size_t)n_cells;
 
-        for (int r = s->r - rad; r <= s->r + rad; r++) {
-            if (r < 0 || r >= R) continue;
-            for (int c = s->c - rad; c <= s->c + rad; c++) {
-                if (c < 0 || c >= C) continue;
-                int idx = r * C + c;
-                if (w->state[idx] != ST_BURNING) continue;
-                if (reported[idx]) continue;
+    for (int r = s->r - rad; r <= s->r + rad; r++) {
+        if (r < 0 || r >= R) continue;
+        for (int c = s->c - rad; c <= s->c + rad; c++) {
+            if (c < 0 || c >= C) continue;
+            int idx = r * C + c;
+            if (w->state[idx] != ST_BURNING) continue;
+            if (reported[idx]) continue;
 
-                reported[idx] = 1;
-                messages_send(w, i, r, c);
-            }
+            reported[idx] = 1;
+            messages_send(w, sensor_idx, r, c, rng);
         }
     }
 }

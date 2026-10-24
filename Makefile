@@ -1,6 +1,7 @@
 CC       = gcc
-CFLAGS   = -std=c11 -Wall -Wextra -Wpedantic -O2 -g -Iinclude -D_POSIX_C_SOURCE=200809L
-LDFLAGS  =
+CFLAGS   = -std=c11 -Wall -Wextra -Wpedantic -O2 -g -Iinclude \
+           -D_POSIX_C_SOURCE=200809L -pthread
+LDFLAGS  = -pthread
 
 SRC_DIR   = src
 BUILD_DIR = build

@@ -5,34 +5,21 @@
 #include "map.h"
 #include "log.h"
 
-/* ─── Состояние пожара на клетке ──────────────────────── */
-typedef enum {
-    ST_SAFE = 0,         /* не горело           */
-    ST_BURNING,          /* горит               */
-    ST_EXTINGUISHED,     /* потушено            */
-    ST_BURNT             /* выгорело полностью  */
-} FireState;
+#include <pthread.h>
+#include <stdatomic.h>
 
-/* ─── Что стоит на клетке ─────────────────────────────── */
-typedef enum {
-    OCC_NONE = 0,
-    OCC_SENSOR,
-    OCC_STATION,
-    OCC_TEAM
-} Occupant;
+#define MAX_SENSOR_THREADS 16
+#define MAX_TEAM_THREADS   16
+#define MAX_FIRE_WORKERS   8
 
-/* ─── Датчик ──────────────────────────────────────────── */
-typedef struct {
-    int id;
-    int r, c;
-} Sensor;
+typedef enum { ST_SAFE = 0, ST_BURNING, ST_EXTINGUISHED, ST_BURNT } FireState;
 
-/* ─── Состояние пожарной группы ───────────────────────── */
+typedef enum { OCC_NONE = 0, OCC_SENSOR, OCC_STATION, OCC_TEAM } Occupant;
+
+typedef struct { int id; int r, c; } Sensor;
+
 typedef enum {
-    TEAM_IDLE = 0,
-    TEAM_MOVING,
-    TEAM_EXTINGUISHING,
-    TEAM_RETURNING
+    TEAM_IDLE = 0, TEAM_MOVING, TEAM_EXTINGUISHING, TEAM_RETURNING
 } TeamState;
 
 typedef struct {
@@ -42,63 +29,54 @@ typedef struct {
     int       target_r, target_c;
     int       target_task_id;
     double    progress;
-
-    /* последняя клетка, о которой группа сообщала как датчик */
     int       last_report_r;
     int       last_report_c;
 } FireTeam;
 
-/* ─── Задача на очаг ──────────────────────────────────── */
 typedef enum {
-    TASK_PENDING = 0,   /* ждёт свободную группу */
-    TASK_ASSIGNED,      /* назначена группе      */
-    TASK_IN_PROGRESS,   /* группа тушит          */
-    TASK_DONE,          /* потушено              */
-    TASK_CANCELLED      /* отменена (выгорело)   */
+    TASK_PENDING = 0, TASK_ASSIGNED, TASK_IN_PROGRESS,
+    TASK_DONE, TASK_CANCELLED
 } TaskState;
 
 typedef struct {
     int       id;
     int       r, c;
     TaskState state;
-    int       assigned_team_id;   /* 0 = не назначена */
+    int       assigned_team_id;
     int       created_tick;
     int       completed_tick;
 } Task;
 
-typedef struct {
-    Task *items;
-    int   count;
-    int   capacity;
-} TaskList;
+typedef struct { Task *items; int count; int capacity; } TaskList;
 
-/* ─── Сообщение ───────────────────────────────────────── */
 typedef struct {
-    int id;                  /* уникальный номер              */
-    int sensor_id;           /* какой датчик его создал       */
-    int origin_r, origin_c;  /* координаты обнаруженного очага */
+    int id;
+    int sensor_id;
+    int origin_r, origin_c;
     int created_tick;
-    int delivery_tick;       /* такт, когда должно прибыть    */
-    int is_duplicate;        /* 1 если это копия в канале     */
+    int delivery_tick;
+    int is_duplicate;
 } Message;
 
 typedef struct {
-    Message *items;
-    int      count;
-    int      capacity;
+    Message        *items;
+    int             count;
+    int             capacity;
+    pthread_mutex_t lock;
 } MessageQueue;
 
-/* ─── Мир ─────────────────────────────────────────────── */
-typedef struct {
+typedef struct World {
     const MapData *map;
     const Config  *cfg;
 
-    int st_r, st_c;            /* позиция станции в этом прогоне */
+    int          st_r, st_c;
+    unsigned int seed;
+    unsigned int main_rng;
 
-    FireState *state;          /* rows*cols */
-    Occupant  *occupant;       /* rows*cols */
-    int       *team_id;        /* rows*cols, 0 = нет команды */
-    int       *burn_age;       /* rows*cols, -1 = не горит, иначе возраст */
+    FireState *state;
+    Occupant  *occupant;
+    int       *team_id;
+    int       *burn_age;
 
     Sensor   *sensors;
     int       sensors_count;
@@ -106,38 +84,53 @@ typedef struct {
     FireTeam *teams;
     int       teams_count;
 
-    /* ── сообщения ── */
     int          next_message_id;
-    MessageQueue in_flight;      /* сейчас в канале         */
-    MessageQueue inbox;          /* доставлены в центр      */
-    int         *seen_ids;       /* id, уже принятые центром */
+    MessageQueue in_flight;
+    MessageQueue inbox;
+    int         *seen_ids;
     int          seen_count;
     int          seen_cap;
-    unsigned char *sensor_reported; /* [sensor_idx * n_cells + cell] */
+    unsigned char *sensor_reported;
 
-    /* ── задачи и центр ── */
     TaskList tasks;
     int      next_task_id;
 
-    /* ── журнал событий ── */
     EventLog log;
-
     int tick;
+
+    /* ── многопоточность ── */
+    pthread_barrier_t barrier_sensors;
+    pthread_barrier_t barrier_teams;
+    pthread_barrier_t barrier_fire;
+
+    pthread_mutex_t   teams_lock;
+
+    atomic_int        stop;
+
+    _Atomic FireState *next_state;
+
+    int num_sensor_threads;
+    int num_team_threads;
+    int num_fire_workers;
+
+    pthread_t sensor_tids[MAX_SENSOR_THREADS];
+    pthread_t team_tids[MAX_TEAM_THREADS];
+    pthread_t fire_tids[MAX_FIRE_WORKERS];
+
+    struct WorkerArg {
+        struct World *w;
+        int           thread_id;
+        unsigned int  rng_state;
+    } sensor_args[MAX_SENSOR_THREADS],
+      team_args[MAX_TEAM_THREADS],
+      fire_args[MAX_FIRE_WORKERS];
 } World;
 
-/* ─── Что показывать в клетке ─────────────────────────── */
-typedef struct {
-    char terrain;   /* '"', 't', 'w', '_' */
-    char state;     /* ' ', 'F', '#'      */
-    char occupant;  /* ' ', '.', 'S', '1'..'9' */
-} CellView;
-
-/* ─── API ─────────────────────────────────────────────── */
+typedef struct { char terrain; char state; char occupant; } CellView;
 
 int  world_init(World *w, const MapData *map, const Config *cfg,
-                int st_r, int st_c);
+                int st_r, int st_c, unsigned int seed);
 void world_free(World *w);
-
 CellView world_cell_view(const World *w, int r, int c);
 char     world_display_symbol(const CellView *cv);
 

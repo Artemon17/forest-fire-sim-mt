@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "threading.h"
 #include "config.h"
 #include "map.h"
 #include "world.h"
@@ -23,7 +24,7 @@ typedef struct {
     int         use_ansi;
     int         scan_stations;
 
-    int         st_r, st_c;         /* заданы вручную? */
+    int         st_r, st_c;
     int         st_given;
 } Options;
 
@@ -42,16 +43,16 @@ static void usage(const char *prog) {
 }
 
 static int parse_args(int argc, char **argv, Options *o) {
-    o->config_path  = "data/conditions.conf";
-    o->map_path     = NULL;
-    o->seed         = (unsigned)time(NULL);
-    o->delay_ms     = 300;
-    o->show_frames  = 1;
-    o->use_ansi     = 1;
+    o->config_path   = "data/conditions.conf";
+    o->map_path      = NULL;
+    o->seed          = (unsigned)time(NULL);
+    o->delay_ms      = 300;
+    o->show_frames   = 1;
+    o->use_ansi      = 1;
     o->scan_stations = 0;
-    o->st_given     = 0;
-    o->st_r         = 0;
-    o->st_c         = 0;
+    o->st_given      = 0;
+    o->st_r          = 0;
+    o->st_c          = 0;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--conditions") && i + 1 < argc)
@@ -82,13 +83,22 @@ static int parse_args(int argc, char **argv, Options *o) {
     return 0;
 }
 
-/* ─── Один прогон с показом кадров ────────────────────── */
+/* ─── Интерактивный прогон ────────────────────────────── */
 
 static SimResult run_interactive(World *w, const Options *o) {
     if (o->use_ansi) {
         term_install_signals();
         if (term_raw_mode() != 0) return RESULT_INTERRUPTED;
         term_hide_cursor();
+    }
+
+    if (world_start_threads(w) != 0) {
+        if (o->use_ansi) {
+            term_show_cursor();
+            term_reset_color();
+            term_restore_mode();
+        }
+        return RESULT_INTERRUPTED;
     }
 
     render_frame(w);
@@ -109,32 +119,49 @@ static SimResult run_interactive(World *w, const Options *o) {
         r = sim_finished(w);
     }
 
+    world_stop_threads(w);
+
+    for (int i = 0; i < w->tasks.count; i++) {
+        Task *t = &w->tasks.items[i];
+        if (t->state == TASK_PENDING ||
+            t->state == TASK_ASSIGNED ||
+            t->state == TASK_IN_PROGRESS) {
+            t->state = TASK_CANCELLED;
+            t->completed_tick = w->tick;
+            }
+    }
+    for (int i = 0; i < w->teams_count; i++) {
+        FireTeam *t = &w->teams[i];
+        t->target_task_id = 0;
+        t->target_r = -1;
+        t->target_c = -1;
+        if (t->state != TEAM_IDLE)
+            t->state = TEAM_IDLE;
+    }
+
     if (o->use_ansi) {
         term_show_cursor();
         term_reset_color();
         term_restore_mode();
-
     }
     return r;
 }
 
-/* ─── Один прогон без кадров ──────────────────────────── */
+/* ─── Тихий прогон (использует sim_run, он сам стартует/стопит потоки) ── */
 
 static SimResult run_quiet(World *w) {
     return sim_run(w);
 }
 
-/* ─── Печать итога ────────────────────────────────────── */
+/* ─── Печать расширенного итога ───────────────────────── */
 
 static void print_result(const char *map_path, const char *config_path,
                          int st_r, int st_c,
                          SimResult r, const World *w, unsigned seed)
 {
-    /* Считаем всё, что нужно для расшифровки */
-    int R = w->map->rows, C = w->map->cols;
-    int total = R * C;
+    int total = w->map->rows * w->map->cols;
 
-    int burning = 0, burnt = 0, ext = 0, safe = 0;
+    int burning = 0, burnt = 0, ext = 0;
     int flammable_total = 0, flammable_untouched = 0;
     for (int i = 0; i < total; i++) {
         Terrain t = w->map->cells[i];
@@ -145,7 +172,6 @@ static void print_result(const char *map_path, const char *config_path,
             case ST_BURNT:        burnt++;   break;
             case ST_EXTINGUISHED: ext++;     break;
             case ST_SAFE:
-                safe++;
                 if (flammable) flammable_untouched++;
                 break;
         }
@@ -162,7 +188,6 @@ static void print_result(const char *map_path, const char *config_path,
         }
     }
 
-    /* Текстовая расшифровка */
     const char *verdict;
     switch (r) {
         case RESULT_EXTINGUISHED:
@@ -224,7 +249,8 @@ static void print_result(const char *map_path, const char *config_path,
     printf("  В пути:         %d\n", w->in_flight.count);
     printf("──────────────────────────\n");
 }
-/* ─── Режим одиночной станции ─────────────────────────── */
+
+/* ─── Режим одной станции ─────────────────────────────── */
 
 static int do_single(const Options *o, const MapData *map, const Config *cfg) {
     int st_r = o->st_given ? o->st_r : 0;
@@ -240,16 +266,15 @@ static int do_single(const Options *o, const MapData *map, const Config *cfg) {
     }
 
     World w;
-    if (world_init(&w, map, cfg, st_r, st_c) != 0) return 5;
-
-    srand(o->seed);
+    if (world_init(&w, map, cfg, st_r, st_c, o->seed) != 0) return 5;
 
     SimResult r;
     if (o->show_frames) r = run_interactive(&w, o);
     else                r = run_quiet(&w);
-    
+
     printf("\n");
     print_result(o->map_path, o->config_path, st_r, st_c, r, &w, o->seed);
+
     world_free(&w);
     return 0;
 }
@@ -281,7 +306,7 @@ static int do_scan(const Options *o, const MapData *map, const Config *cfg) {
         int sc = map->station_candidates[i].c;
 
         World w;
-        if (world_init(&w, map, cfg, sr, sc) != 0) {
+        if (world_init(&w, map, cfg, sr, sc, o->seed) != 0) {
             rows[i].r = sr; rows[i].c = sc;
             rows[i].result = RESULT_INTERRUPTED;
             rows[i].ticks = -1;
@@ -289,29 +314,29 @@ static int do_scan(const Options *o, const MapData *map, const Config *cfg) {
             rows[i].ext = 0;
             continue;
         }
-        srand(o->seed);   /* одинаковый поток случайностей для всех */
+
         SimResult r = sim_run(&w);
-        rows[i].r = sr;
-        rows[i].c = sc;
+
+        rows[i].r      = sr;
+        rows[i].c      = sc;
         rows[i].result = r;
         rows[i].ticks  = w.tick;
 
         int burnt = 0, ext = 0;
         for (int j = 0; j < w.map->rows * w.map->cols; j++) {
-            if (w.state[j] == ST_BURNT) burnt++;
+            if      (w.state[j] == ST_BURNT)        burnt++;
             else if (w.state[j] == ST_EXTINGUISHED) ext++;
         }
         rows[i].burnt = burnt;
-        rows[i].ext = ext;
+        rows[i].ext   = ext;
 
         world_free(&w);
 
         printf("  (%2d,%2d): %-20s %4d тактов  выгорело %3d  потушено %3d\n",
-       sr + 1, sc + 1, sim_result_name(r), rows[i].ticks,
-       rows[i].burnt, rows[i].ext);
+               sr + 1, sc + 1, sim_result_name(r), rows[i].ticks,
+               rows[i].burnt, rows[i].ext);
     }
 
-    /* лучший результат */
     int best = -1;
     for (int i = 0; i < map->station_candidates_count; i++) {
         if (rows[i].result != RESULT_EXTINGUISHED) continue;
@@ -349,7 +374,7 @@ int main(int argc, char **argv) {
     MapData map;
     if (map_load(o.map_path, &map) != 0) return 4;
 
-    int rc = 0;
+    int rc;
     if (o.scan_stations)
         rc = do_scan(&o, &map, &cfg);
     else

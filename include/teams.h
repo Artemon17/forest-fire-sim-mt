@@ -3,10 +3,8 @@
 
 #include "world.h"
 
-/* Фаза 4: движение групп к цели.
- * Фаза 5: тушение цели (если группа на ней или рядом). */
-void teams_move(World *w);
-void teams_extinguish(World *w);
-void teams_observe(World *w);
+void teams_observe(World *w, unsigned int *rng);
+void teams_move_one(World *w, int team_idx);
+void teams_extinguish_one(World *w, int team_idx);
 
 #endif
